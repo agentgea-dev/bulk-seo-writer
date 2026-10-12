@@ -1,43 +1,33 @@
 /**
- * e2e verification for the SEO scorer — checks computed metrics against
- * hand-counted expected values. Run: node e2e.mjs
+ * e2e verification for the SEO scorer, demo samples, and rate limiter —
+ * checks computed values against hand-counted expected values.
+ * Run: npm test (or node e2e.mjs)
  *
  * This is the gate: the scorer must match manual counts, not just "render".
- * Uses tsx-free plain import via a tiny transpile shim: we import the compiled
- * logic by re-implementing nothing — instead we exercise the TS through the
- * Next build's node runtime by importing the source with a loader.
- *
- * To keep it dependency-free, we duplicate NO logic: we spawn `npx tsx` if
- * available, else fall back to a JS mirror check. Simpler: we import via a
- * dynamic data: URL after stripping types is overkill — so this file imports
- * the built module through ts at runtime using Node's --experimental loaders
- * is fragile. Instead we test the pure functions by importing a compiled copy.
+ * The TS sources are compiled with the local `tsc` into a temp dir and
+ * imported as ESM; no logic is duplicated here.
  */
 import assert from "node:assert";
 import { execSync } from "node:child_process";
-
-// Transpile the scorer to plain JS on the fly with esbuild (bundled via next).
-import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
+import { copyFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// Compile the scorer TS -> ESM JS with the local TypeScript compiler, then import it.
-let mod;
-{
-  const dir = mkdtempSync(join(tmpdir(), "seo-"));
-  const tsIn = join(dir, "seo-scorer.ts");
-  const src = readFileSync(new URL("./src/lib/seo-scorer.ts", import.meta.url), "utf8");
-  writeFileSync(tsIn, src);
-  execSync(
-    `node_modules/.bin/tsc "${tsIn}" --target ES2020 --module esnext --moduleResolution bundler --outDir "${dir}" --skipLibCheck`,
-    { cwd: new URL(".", import.meta.url).pathname, stdio: "inherit" }
-  );
-  const outJs = join(dir, "seo-scorer.js");
-  // rename to .mjs so Node treats it as ESM regardless of package type
-  const mjs = join(dir, "seo-scorer.mjs");
-  writeFileSync(mjs, readFileSync(outJs, "utf8"));
-  mod = await import(`file://${mjs}`);
+const root = new URL(".", import.meta.url).pathname;
+const dir = mkdtempSync(join(tmpdir(), "seo-"));
+const MODULES = ["seo-scorer", "samples", "rate-limit"];
+execSync(
+  `node_modules/.bin/tsc ${MODULES.map((m) => `src/lib/${m}.ts`).join(" ")} --target ES2020 --module esnext --moduleResolution bundler --outDir "${dir}" --skipLibCheck`,
+  { cwd: root, stdio: "inherit" }
+);
+// .mjs so Node treats the output as ESM regardless of package type. These
+// modules have no runtime relative imports (samples.ts imports types only).
+async function load(name) {
+  const mjs = join(dir, `${name}.mjs`);
+  copyFileSync(join(dir, `${name}.js`), mjs);
+  return import(`file://${mjs}`);
 }
+const [scorer, samples, rateLimit] = await Promise.all(MODULES.map(load));
 
 const {
   tokenizeWords,
@@ -47,7 +37,10 @@ const {
   countSyllables,
   fleschReadingEase,
   scoreContent,
-} = mod;
+  plateauScore,
+} = scorer;
+const { SAMPLE_ARTICLES, pickSample } = samples;
+const { createRateLimiter, readPositiveInt } = rateLimit;
 
 let pass = 0;
 function check(name, fn) {
@@ -62,6 +55,9 @@ console.log("SEO scorer e2e");
 check("tokenizeWords counts words", () => {
   const words = tokenizeWords("Satu dua tiga, empat lima.");
   assert.strictEqual(words.length, 5, `got ${words.length}`);
+});
+check("tokenizeWords keeps straight and curly apostrophes inside a word", () => {
+  assert.deepStrictEqual(tokenizeWords("don't don\u2019t"), ["don't", "don\u2019t"]);
 });
 
 // --- keyword counting (multi-word, non-overlapping) ---
@@ -145,6 +141,84 @@ check("empty text does not crash", () => {
   const r = scoreContent("", { keyword: "x", targetWords: 100, meta: "" });
   assert.strictEqual(r.raw.wordCount, 0);
   assert.strictEqual(r.overall >= 0, true);
+});
+
+// --- scoring curves agree with the hints ---
+check("plateauScore: 0 / ramp / 100 across healthy range / ramp / 0", () => {
+  // density curve: 0 at 0%, 100 on [0.5, 3], 0 at 4%
+  assert.strictEqual(plateauScore(0, 0, 0.5, 3, 4), 0);
+  assert.strictEqual(plateauScore(0.25, 0, 0.5, 3, 4), 50);
+  assert.strictEqual(plateauScore(0.5, 0, 0.5, 3, 4), 100);
+  assert.strictEqual(plateauScore(3, 0, 0.5, 3, 4), 100);
+  assert.strictEqual(plateauScore(3.5, 0, 0.5, 3, 4), 50);
+  assert.strictEqual(plateauScore(4, 0, 0.5, 3, 4), 0);
+});
+
+check("metric scores on the hand-counted article", () => {
+  const md = "# Kopi Hitam\n\nKopi hitam enak. Kopi hitam sehat.\n\n## Manfaat\n\nKopi hitam murah dan nikmat.";
+  const r = scoreContent(md, { keyword: "kopi hitam", targetWords: 400, meta: "x".repeat(150), language: "id" });
+  const by = Object.fromEntries(r.metrics.map((m) => [m.key, m.score]));
+  assert.strictEqual(by.density, 0, "28.6% is past the 4% cutoff");
+  assert.strictEqual(by.meta, 100, "150 chars is inside 120-160");
+  assert.strictEqual(by.headings, 67, "H1 ok (50) + one H2 (50/3)");
+  assert.strictEqual(by.length, 0, "14 words is under 0.4 x 400");
+});
+
+check("very easy English text gets full readability (was 0 before)", () => {
+  // words=6, sentences=2, syllables=6 -> Flesch 119.2
+  const r = scoreContent("The cat sat. The dog ran.", { language: "en" });
+  assert.strictEqual(r.raw.flesch, 119.2, `flesch ${r.raw.flesch}`);
+  assert.strictEqual(r.metrics.find((m) => m.key === "readability").score, 100);
+});
+
+check("Indonesian readability uses average sentence length", () => {
+  const short = scoreContent("Satu dua tiga. Empat lima enam.", { language: "id" });
+  assert.strictEqual(short.raw.avgSentenceLength, 3);
+  assert.strictEqual(short.metrics.find((m) => m.key === "readability").score, 100);
+  // one 30-word sentence: (35 - 30) / (35 - 20) = 33%
+  const long = scoreContent(Array(30).fill("kata").join(" ") + ".", { language: "id" });
+  assert.strictEqual(long.raw.avgSentenceLength, 30);
+  assert.strictEqual(long.metrics.find((m) => m.key === "readability").score, 33);
+});
+
+// --- demo samples ---
+check("pickSample returns the sample written for each default keyword", () => {
+  for (const a of SAMPLE_ARTICLES) {
+    const { article, exact } = pickSample(`  ${a.keyword.toUpperCase()} `);
+    assert.strictEqual(exact, true, a.keyword);
+    assert.strictEqual(article.keyword, a.keyword);
+  }
+  const other = pickSample("resep nasi goreng");
+  assert.strictEqual(other.exact, false);
+  assert.ok(SAMPLE_ARTICLES.includes(other.article));
+});
+
+check("each sample scores >= B on default settings (id, 800 words)", () => {
+  for (const a of SAMPLE_ARTICLES) {
+    const r = scoreContent(a.body, { keyword: a.keyword, targetWords: 800, meta: a.meta, language: a.language });
+    assert.ok(r.overall >= 70, `${a.keyword}: ${r.overall} ${r.grade}`);
+  }
+});
+
+// --- rate limiter ---
+check("rate limiter blocks after max, per key, and resets after the window", () => {
+  let t = 0;
+  const limit = createRateLimiter(2, 1000, () => t);
+  assert.strictEqual(limit("a").ok, true);
+  assert.strictEqual(limit("a").ok, true);
+  const blocked = limit("a");
+  assert.strictEqual(blocked.ok, false);
+  assert.strictEqual(blocked.retryAfterSec, 1);
+  assert.strictEqual(limit("b").ok, true, "other keys are independent");
+  t = 1000;
+  assert.strictEqual(limit("a").ok, true, "window reset");
+});
+
+check("readPositiveInt falls back on invalid env values", () => {
+  assert.strictEqual(readPositiveInt("25", 40), 25);
+  for (const bad of [undefined, "", "0", "-3", "2.5", "abc"]) {
+    assert.strictEqual(readPositiveInt(bad, 40), 40, String(bad));
+  }
 });
 
 console.log(`\n${pass} checks passed.`);

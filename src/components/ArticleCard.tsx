@@ -13,10 +13,12 @@ function toMarkdownFile(a: Article): string {
 export default function ArticleCard({
   article,
   mode,
+  note,
   targetWords,
 }: {
   article: Article;
   mode: "llm" | "demo";
+  note?: string;
   targetWords: number;
 }) {
   const [copied, setCopied] = useState(false);
@@ -26,6 +28,7 @@ export default function ArticleCard({
         keyword: article.keyword,
         targetWords,
         meta: article.meta,
+        language: article.language ?? "id",
       }),
     [article, targetWords]
   );
@@ -63,6 +66,7 @@ export default function ArticleCard({
             {mode === "llm" ? "LLM mode" : "demo mode (artikel contoh)"}
           </span>
         </div>
+        {note && <p className="mb-2 text-xs text-amber-700">{note}</p>}
         <h3 className="text-lg font-bold">{article.title}</h3>
         <p className="mt-1 text-sm italic text-slate-500">{article.meta}</p>
         <div className="mt-3 max-h-72 overflow-y-auto rounded-lg border border-slate-100 bg-slate-50 p-3 text-sm">

@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { scoreContent } from "@/lib/seo-scorer";
+import { scoreContent, type ScoreLanguage } from "@/lib/seo-scorer";
 import ScoreCard from "./ScoreCard";
 
 const DEFAULT_TEXT = `# Panduan Singkat Menulis Meta Description
@@ -23,9 +23,13 @@ export default function ScorerPlayground() {
     "Pelajari cara menulis meta description yang menarik: panjang ideal, penempatan keyword, dan ajakan klik untuk hasil pencarian Google."
   );
 
+  const [language, setLanguage] = useState<ScoreLanguage>("id");
+  const [targetRaw, setTargetRaw] = useState("300");
+  const targetWords = Number(targetRaw) > 0 ? Number(targetRaw) : 300;
+
   const report = useMemo(
-    () => scoreContent(text, { keyword, targetWords: 300, meta }),
-    [text, keyword, meta]
+    () => scoreContent(text, { keyword, targetWords, meta, language }),
+    [text, keyword, meta, language, targetWords]
   );
 
   return (
@@ -39,6 +43,34 @@ export default function ScorerPlayground() {
           onChange={(e) => setKeyword(e.target.value)}
           className="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm"
         />
+        <div className="mt-3 grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-xs font-medium text-slate-500">
+              Bahasa teks
+            </label>
+            <select
+              value={language}
+              onChange={(e) => setLanguage(e.target.value as ScoreLanguage)}
+              className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+            >
+              <option value="id">Indonesia (panjang kalimat)</option>
+              <option value="en">English (Flesch)</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-500">
+              Target kata
+            </label>
+            <input
+              type="number"
+              min={50}
+              step={50}
+              value={targetRaw}
+              onChange={(e) => setTargetRaw(e.target.value)}
+              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm"
+            />
+          </div>
+        </div>
         <label className="mt-3 block text-xs font-medium text-slate-500">
           Meta description
         </label>

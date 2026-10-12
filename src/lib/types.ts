@@ -13,6 +13,7 @@ export const ArticleSchema = z.object({
   title: z.string(),
   meta: z.string(),
   body: z.string(), // markdown
+  language: z.enum(["id", "en"]).optional(), // language the body is written in
 });
 export type Article = z.infer<typeof ArticleSchema>;
 

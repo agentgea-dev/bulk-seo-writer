@@ -5,14 +5,17 @@ import type { Article } from "@/lib/types";
 import { LENGTH_WORDS } from "@/lib/types";
 import ArticleCard, { slugify } from "./ArticleCard";
 
-type Status = "pending" | "generating" | "done" | "error";
+type Status = "pending" | "generating" | "done" | "error" | "cancelled";
 
 interface QueueItem {
   id: string;
   keyword: string;
   status: Status;
+  /** length target at generation time, so later setting changes don't rescore */
+  targetWords: number;
   article?: Article;
   mode?: "llm" | "demo";
+  note?: string;
   error?: string;
 }
 
@@ -28,6 +31,8 @@ export default function BatchWriter() {
   const [running, setRunning] = useState(false);
   const [serverMode, setServerMode] = useState<"llm" | "demo" | "unknown">("unknown");
   const cancelRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
+  const demo = serverMode === "demo";
 
   useEffect(() => {
     fetch("/api/generate")
@@ -48,18 +53,22 @@ export default function BatchWriter() {
     if (keywords.length === 0) return;
     cancelRef.current = false;
     setRunning(true);
+    const targetWords = LENGTH_WORDS[length];
     const items: QueueItem[] = keywords.map((k, i) => ({
       id: `${Date.now()}-${i}`,
       keyword: k,
       status: "pending",
+      targetWords,
     }));
     setQueue(items);
+    const update = (i: number, patch: Partial<QueueItem>) =>
+      setQueue((q) => q.map((it, idx) => (idx === i ? { ...it, ...patch } : it)));
 
     for (let i = 0; i < items.length; i++) {
       if (cancelRef.current) break;
-      setQueue((q) =>
-        q.map((it, idx) => (idx === i ? { ...it, status: "generating" } : it))
-      );
+      update(i, { status: "generating" });
+      const controller = new AbortController();
+      abortRef.current = controller;
       try {
         const res = await fetch("/api/generate", {
           method: "POST",
@@ -68,32 +77,34 @@ export default function BatchWriter() {
             keyword: items[i].keyword,
             config: { tone, length, language },
           }),
+          signal: controller.signal,
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
         if (!res.ok || data.error) {
+          // Rate-limited: every remaining request would be rejected too.
+          if (res.status === 429) cancelRef.current = true;
           throw new Error(data.error || `HTTP ${res.status}`);
         }
-        setQueue((q) =>
-          q.map((it, idx) =>
-            idx === i
-              ? { ...it, status: "done", article: data.article, mode: data.mode }
-              : it
-          )
-        );
+        update(i, { status: "done", article: data.article, mode: data.mode, note: data.note });
       } catch (err) {
+        if (controller.signal.aborted) {
+          update(i, { status: "cancelled" });
+          break;
+        }
         const msg = err instanceof Error ? err.message : "gagal";
-        setQueue((q) =>
-          q.map((it, idx) =>
-            idx === i ? { ...it, status: "error", error: msg } : it
-          )
-        );
+        update(i, { status: "error", error: msg });
       }
     }
+    abortRef.current = null;
+    setQueue((q) =>
+      q.map((it) => (it.status === "pending" ? { ...it, status: "cancelled" } : it))
+    );
     setRunning(false);
   };
 
   const stop = () => {
     cancelRef.current = true;
+    abortRef.current?.abort();
   };
 
   const downloadZip = async () => {
@@ -148,8 +159,9 @@ export default function BatchWriter() {
             <label className="block text-xs font-medium text-slate-500">Nada</label>
             <select
               value={tone}
+              disabled={demo}
               onChange={(e) => setTone(e.target.value)}
-              className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+              className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm disabled:bg-slate-100 disabled:text-slate-400"
             >
               <option value="informatif">Informatif</option>
               <option value="profesional">Profesional</option>
@@ -161,8 +173,9 @@ export default function BatchWriter() {
             <label className="block text-xs font-medium text-slate-500">Panjang</label>
             <select
               value={length}
+              disabled={demo}
               onChange={(e) => setLength(e.target.value as any)}
-              className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+              className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm disabled:bg-slate-100 disabled:text-slate-400"
             >
               <option value="pendek">Pendek (~400)</option>
               <option value="sedang">Sedang (~800)</option>
@@ -173,13 +186,20 @@ export default function BatchWriter() {
             <label className="block text-xs font-medium text-slate-500">Bahasa</label>
             <select
               value={language}
+              disabled={demo}
               onChange={(e) => setLanguage(e.target.value as any)}
-              className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+              className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm disabled:bg-slate-100 disabled:text-slate-400"
             >
               <option value="id">Indonesia</option>
               <option value="en">English</option>
             </select>
           </div>
+          {demo && (
+            <p className="text-xs text-slate-400">
+              Nada, panjang, dan bahasa hanya berlaku di mode LLM. Artikel
+              contoh ditulis dalam bahasa Indonesia, panjang sedang.
+            </p>
+          )}
         </div>
       </div>
 
@@ -227,7 +247,8 @@ export default function BatchWriter() {
                 <ArticleCard
                   article={it.article}
                   mode={it.mode || "demo"}
-                  targetWords={LENGTH_WORDS[length]}
+                  note={it.note}
+                  targetWords={it.targetWords}
                 />
               ) : (
                 <div className="flex items-center gap-3 rounded-lg border border-slate-200 bg-white p-3 text-sm">
@@ -237,6 +258,7 @@ export default function BatchWriter() {
                     {it.status === "pending" && "menunggu…"}
                     {it.status === "generating" && "sedang menulis…"}
                     {it.status === "error" && `error: ${it.error}`}
+                    {it.status === "cancelled" && "dibatalkan"}
                   </span>
                 </div>
               )}
@@ -254,6 +276,7 @@ function StatusDot({ status }: { status: Status }) {
     generating: "bg-amber-400 animate-pulse",
     done: "bg-emerald-500",
     error: "bg-red-500",
+    cancelled: "bg-slate-200",
   };
   return <span className={`h-2.5 w-2.5 rounded-full ${map[status]}`} />;
 }

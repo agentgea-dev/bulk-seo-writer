@@ -84,6 +84,7 @@ export async function generateArticle(
     title: validated.title.trim(),
     meta: validated.meta.trim(),
     body: validated.body.trim(),
+    language: config.language,
   };
   return ArticleSchema.parse(article);
 }

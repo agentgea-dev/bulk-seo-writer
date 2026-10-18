@@ -44,9 +44,9 @@ export default function ScoreCard({ report }: { report: SeoReport }) {
       <ul className="mt-4 space-y-3">
         {report.metrics.map((m) => (
           <li key={m.key}>
-            <div className="flex items-baseline justify-between text-sm">
+            <div className="flex items-baseline justify-between gap-3 text-sm">
               <span className="font-medium text-slate-700">{m.label}</span>
-              <span className="tabular-nums text-slate-500">{m.value}</span>
+              <span className="text-right tabular-nums text-slate-500">{m.value}</span>
             </div>
             <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
               <div

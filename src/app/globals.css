@@ -25,3 +25,15 @@ body {
 .prose-md ul {
   @apply list-disc pl-5 my-2 text-slate-700;
 }
+.prose-md ol {
+  @apply list-decimal pl-5 my-2 text-slate-700;
+}
+.prose-md strong {
+  @apply font-semibold text-slate-800;
+}
+.prose-md a {
+  @apply text-indigo-600 underline;
+}
+.prose-md code {
+  @apply rounded bg-slate-200 px-1 text-xs;
+}

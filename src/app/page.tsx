@@ -9,7 +9,7 @@ export default function Home() {
         <p className="mt-2 max-w-2xl text-slate-600">
           Tempel daftar keyword → generate artikel secara batch → tiap artikel
           dapat <strong>kartu skor SEO deterministik</strong> (keyword density,
-          keterbacaan Flesch, struktur heading, meta description, panjang) →
+          keterbacaan, struktur heading, meta description, panjang) →
           ekspor Markdown atau unduh semua sebagai .zip.
         </p>
         <p className="mt-2 text-sm text-slate-400">

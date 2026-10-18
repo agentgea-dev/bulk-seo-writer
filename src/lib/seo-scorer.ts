@@ -34,6 +34,7 @@ export interface SeoReport {
     metaLength: number;
     sentenceCount: number;
     syllableCount: number;
+    avgSentenceLength: number; // words per sentence
   };
 }
 
@@ -64,7 +65,7 @@ export function stripMarkdown(md: string): string {
 
 /** Split plain text into words (unicode-letter/number runs). */
 export function tokenizeWords(text: string): string[] {
-  const matches = text.toLowerCase().match(/[\p{L}\p{N}]+(?:[''-][\p{L}\p{N}]+)*/gu);
+  const matches = text.toLowerCase().match(/[\p{L}\p{N}]+(?:['\u2019-][\p{L}\p{N}]+)*/gu);
   return matches ?? [];
 }
 
@@ -152,15 +153,34 @@ function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
 }
 
-/** Triangular scoring: 100 at ideal, falling linearly to 0 at the bounds. */
-function bandScore(value: number, min: number, ideal: number, max: number): number {
-  if (value <= min || value >= max) return 0;
-  if (value === ideal) return 100;
-  if (value < ideal) {
-    return clamp(((value - min) / (ideal - min)) * 100, 0, 100);
+/**
+ * Plateau scoring: 0 at or below `lo0`, rising linearly to 100 at `lo100`,
+ * 100 across the healthy range [lo100, hi100], falling linearly to 0 at `hi0`.
+ * The healthy range is the same range the metric's hint calls good, so a
+ * "healthy" hint never sits next to a red bar.
+ */
+export function plateauScore(
+  value: number,
+  lo0: number,
+  lo100: number,
+  hi100: number,
+  hi0: number
+): number {
+  if (value < lo100) {
+    return value <= lo0 ? 0 : clamp(((value - lo0) / (lo100 - lo0)) * 100, 0, 100);
   }
-  return clamp(((max - value) / (max - ideal)) * 100, 0, 100);
+  if (value <= hi100) return 100;
+  return value >= hi0 ? 0 : clamp(((hi0 - value) / (hi0 - hi100)) * 100, 0, 100);
 }
+
+// Healthy ranges, shared by scores and hints.
+const DENSITY = { lo: 0.5, hi: 3, max: 4 }; // percent
+const FLESCH = { min: 10, easy: 60, fair: 30 };
+const SENTENCE = { ideal: 20, long: 25, max: 35 }; // words per sentence
+const META = { min: 50, lo: 120, hi: 160, max: 200 }; // characters
+const LENGTH = { min: 0.4, lo: 0.8, hi: 1.3, max: 1.8 }; // x target words
+
+export type ScoreLanguage = "id" | "en";
 
 export interface ScoreOptions {
   /** target keyword to measure density for */
@@ -169,10 +189,16 @@ export interface ScoreOptions {
   targetWords?: number;
   /** meta description text (measured separately) */
   meta?: string;
+  /**
+   * Language of the text. "en" scores readability with Flesch Reading Ease.
+   * "id" uses average sentence length instead: Flesch's constants and the
+   * syllable heuristic are English-only and score normal Indonesian prose ~0.
+   */
+  language?: ScoreLanguage;
 }
 
 export function scoreContent(markdown: string, opts: ScoreOptions = {}): SeoReport {
-  const { keyword = "", targetWords = 800, meta = "" } = opts;
+  const { keyword = "", targetWords = 800, meta = "", language = "en" } = opts;
 
   const plain = stripMarkdown(markdown);
   const words = tokenizeWords(plain);
@@ -181,6 +207,8 @@ export function scoreContent(markdown: string, opts: ScoreOptions = {}): SeoRepo
   const sentenceCount = sentences.length;
   const syllableCount = words.reduce((acc, w) => acc + countSyllables(w), 0);
   const flesch = fleschReadingEase(wordCount, sentenceCount, syllableCount);
+  const avgSentenceLength =
+    sentenceCount > 0 ? Math.round((wordCount / sentenceCount) * 10) / 10 : 0;
   const headings = countHeadings(markdown);
   const keywordCount = keyword ? countKeyword(words, keyword) : 0;
   const keywordDensity =
@@ -189,9 +217,9 @@ export function scoreContent(markdown: string, opts: ScoreOptions = {}): SeoRepo
 
   const metrics: SeoMetric[] = [];
 
-  // 1. Keyword density: ideal 1.5%, acceptable 0.5–3%
+  // 1. Keyword density: healthy 0.5–3%
   if (keyword) {
-    const s = bandScore(keywordDensity, 0, 1.5, 4);
+    const s = plateauScore(keywordDensity, 0, DENSITY.lo, DENSITY.hi, DENSITY.max);
     metrics.push({
       key: "density",
       label: "Keyword density",
@@ -200,9 +228,9 @@ export function scoreContent(markdown: string, opts: ScoreOptions = {}): SeoRepo
       hint:
         keywordDensity === 0
           ? `Keyword "${keyword}" tidak muncul — sisipkan secara alami.`
-          : keywordDensity > 3
+          : keywordDensity > DENSITY.hi
           ? "Terlalu padat, berisiko keyword stuffing."
-          : keywordDensity < 0.5
+          : keywordDensity < DENSITY.lo
           ? "Terlalu jarang — tambah 1–2 kemunculan."
           : "Rentang sehat (0.5–3%).",
     });
@@ -216,20 +244,40 @@ export function scoreContent(markdown: string, opts: ScoreOptions = {}): SeoRepo
     });
   }
 
-  // 2. Flesch reading ease: ideal ~65 (plain), band 30–90
-  {
-    const s = bandScore(flesch, 10, 65, 100);
+  // 2. Readability. English: Flesch, easy at >= 60 (higher is easier).
+  //    Indonesian: average sentence length, easy at <= 20 words.
+  if (language === "en") {
+    const s = plateauScore(flesch, FLESCH.min, FLESCH.easy, Infinity, Infinity);
     metrics.push({
-      key: "flesch",
+      key: "readability",
       label: "Keterbacaan (Flesch)",
       value: `${flesch}`,
       score: Math.round(s),
       hint:
-        flesch >= 60
+        flesch >= FLESCH.easy
           ? "Mudah dibaca (setara SMP–SMA)."
-          : flesch >= 30
+          : flesch >= FLESCH.fair
           ? "Cukup sulit — pendekkan kalimat."
           : "Sangat sulit — banyak kalimat/kata panjang.",
+    });
+  } else {
+    const s =
+      sentenceCount === 0
+        ? 0
+        : plateauScore(avgSentenceLength, 0, 0, SENTENCE.ideal, SENTENCE.max);
+    metrics.push({
+      key: "readability",
+      label: "Keterbacaan (panjang kalimat)",
+      value: `${avgSentenceLength} kata/kalimat`,
+      score: Math.round(s),
+      hint:
+        sentenceCount === 0
+          ? "Belum ada kalimat untuk diukur."
+          : avgSentenceLength <= SENTENCE.ideal
+          ? "Kalimat ringkas, mudah dibaca."
+          : avgSentenceLength <= SENTENCE.long
+          ? "Agak panjang — pecah beberapa kalimat."
+          : "Kalimat terlalu panjang — pecah jadi kalimat pendek.",
     });
   }
 
@@ -257,7 +305,7 @@ export function scoreContent(markdown: string, opts: ScoreOptions = {}): SeoRepo
 
   // 4. Meta description: ideal 120–160 chars
   {
-    const s = bandScore(metaLength, 50, 150, 200);
+    const s = plateauScore(metaLength, META.min, META.lo, META.hi, META.max);
     metrics.push({
       key: "meta",
       label: "Meta description",
@@ -266,27 +314,33 @@ export function scoreContent(markdown: string, opts: ScoreOptions = {}): SeoRepo
       hint:
         metaLength === 0
           ? "Tulis meta description 120–160 karakter."
-          : metaLength < 120
+          : metaLength < META.lo
           ? "Terlalu pendek untuk SERP."
-          : metaLength > 160
+          : metaLength > META.hi
           ? "Akan terpotong di Google (>160)."
           : "Panjang ideal (120–160).",
     });
   }
 
-  // 5. Length vs target: ideal at target, band target*0.5 .. target*1.5
+  // 5. Length vs target: healthy at 0.8x–1.3x target, 0 below 0.4x / above 1.8x
   {
-    const s = bandScore(wordCount, targetWords * 0.4, targetWords, targetWords * 1.8);
+    const s = plateauScore(
+      wordCount,
+      targetWords * LENGTH.min,
+      targetWords * LENGTH.lo,
+      targetWords * LENGTH.hi,
+      targetWords * LENGTH.max
+    );
     metrics.push({
       key: "length",
       label: "Panjang artikel",
       value: `${wordCount} / target ${targetWords} kata`,
       score: Math.round(s),
       hint:
-        wordCount < targetWords * 0.7
+        wordCount < targetWords * LENGTH.lo
           ? "Di bawah target — tambah kedalaman."
-          : wordCount > targetWords * 1.5
-          ? "Jauh di atas target."
+          : wordCount > targetWords * LENGTH.hi
+          ? "Di atas target."
           : "Panjang sesuai target.",
     });
   }
@@ -294,7 +348,7 @@ export function scoreContent(markdown: string, opts: ScoreOptions = {}): SeoRepo
   // Weighted overall
   const weights: Record<string, number> = {
     density: 0.2,
-    flesch: 0.25,
+    readability: 0.25,
     headings: 0.25,
     meta: 0.15,
     length: 0.15,
@@ -319,6 +373,7 @@ export function scoreContent(markdown: string, opts: ScoreOptions = {}): SeoRepo
       metaLength,
       sentenceCount,
       syllableCount,
+      avgSentenceLength,
     },
   };
 }
